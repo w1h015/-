@@ -1,0 +1,109 @@
+/* 一次性工具：审计每个分镜每帧是否顶到 cell 边框（即打包时被裁掉）。
+   顶边 = 猫在那一帧被切掉了身体的一部分。
+   用法： electron.exe tools/_clip_audit.js
+   启动前必须清空 ELECTRON_RUN_AS_NODE。 */
+const { app, BrowserWindow } = require('electron');
+const path = require('path');
+const fs = require('fs');
+
+const html = `<!doctype html><html><body style="margin:0">
+<canvas id="c" width="256" height="256"></canvas>
+<script>
+const BASE = ${JSON.stringify('file:///' + path.join(__dirname, '..', 'assets_sprites').replace(/\\\\/g, '/'))};
+async function main() {
+  const meta = await (await fetch(BASE + '/meta.json')).json();
+  const cv = document.getElementById('c');
+  const x = cv.getContext('2d', { willReadFrequently: true });
+  const res = {};
+  for (const clip of Object.keys(meta)) {
+    const m = meta[clip];
+    const CELL = m.cell;            // 取景格子每条分镜不同（位移大的更大）
+    const sheets = [];
+    for (const s of m.sheets) {
+      const img = new Image(); img.src = BASE + '/' + s.file;
+      await new Promise(r => { img.onload = r; img.onerror = r; });
+      sheets.push(img);
+    }
+    const per = m.sheet * m.sheet;
+    const rows = [];
+    let union = null;
+    for (let f = 0; f < m.frames; f++) {
+      const img = sheets[Math.floor(f / per)];
+      const k = f % per;
+      const sx = (k % m.sheet) * CELL, sy = Math.floor(k / m.sheet) * CELL;
+      if (cv.width !== CELL) { cv.width = CELL; cv.height = CELL; }
+      x.clearRect(0, 0, CELL, CELL);
+      x.drawImage(img, sx, sy, CELL, CELL, 0, 0, CELL, CELL);
+      const d = x.getImageData(0, 0, CELL, CELL).data;
+      let x0 = 1e9, y0 = 1e9, x1 = -1, y1 = -1, n = 0;
+      for (let p = 0; p < CELL; p++) {
+        for (let q = 0; q < CELL; q++) {
+          if (d[(p * CELL + q) * 4 + 3] > 110) {
+            n++;
+            if (q < x0) x0 = q; if (q > x1) x1 = q;
+            if (p < y0) y0 = p; if (p > y1) y1 = p;
+          }
+        }
+      }
+      // 四条边上 alpha>110 的像素数：>0 说明这一帧被 cell 切掉了
+      let bT = 0, bB = 0, bL = 0, bR = 0;
+      for (let q = 0; q < CELL; q++) {
+        if (d[(0 * CELL + q) * 4 + 3] > 110) bT++;
+        if (d[((CELL - 1) * CELL + q) * 4 + 3] > 110) bB++;
+        if (d[(q * CELL + 0) * 4 + 3] > 110) bL++;
+        if (d[(q * CELL + CELL - 1) * 4 + 3] > 110) bR++;
+      }
+      rows.push({ f, x0, y0, x1, y1, w: x1 - x0 + 1, h: y1 - y0 + 1, n, bT, bB, bL, bR });
+      if (union === null) union = { x0, y0, x1, y1 };
+      else {
+        union.x0 = Math.min(union.x0, x0); union.y0 = Math.min(union.y0, y0);
+        union.x1 = Math.max(union.x1, x1); union.y1 = Math.max(union.y1, y1);
+      }
+    }
+    const bad = rows.filter(r => r.bT + r.bB + r.bL + r.bR > 0);
+    res[clip] = {
+      frames: m.frames, union,
+      badCount: bad.length,
+      bad: bad.map(r => ({ f: r.f, bT: r.bT, bB: r.bB, bL: r.bL, bR: r.bR, w: r.w, h: r.h })),
+      maxW: Math.max(...rows.map(r => r.w)), maxH: Math.max(...rows.map(r => r.h)),
+    };
+  }
+  window.__res = res;
+  document.title = 'done';
+}
+main();
+</script></body></html>`;
+
+app.commandLine.appendSwitch('use-angle', 'swiftshader');
+app.commandLine.appendSwitch('use-gl', 'angle');
+app.commandLine.appendSwitch('enable-unsafe-swiftshader');
+app.commandLine.appendSwitch('no-sandbox');
+app.commandLine.appendSwitch('disable-gpu-sandbox');
+
+app.whenReady().then(async () => {
+  const win = new BrowserWindow({
+    show: false, width: 320, height: 320,
+    webPreferences: { offscreen: true, webSecurity: false, allowFileAccessFromFiles: true }
+  });
+  const tmp = path.join(__dirname, '_clip_audit.html');
+  fs.writeFileSync(tmp, html);
+  await win.loadFile(tmp);
+  for (let i = 0; i < 120; i++) {
+    const t = await win.webContents.executeJavaScript('document.title');
+    if (t === 'done') break;
+    await new Promise(r => setTimeout(r, 200));
+  }
+  const res = await win.webContents.executeJavaScript('window.__res');
+  fs.unlinkSync(tmp);
+  for (const clip of Object.keys(res || {})) {
+    const r = res[clip];
+    const u = r.union;
+    console.log(`${clip.padEnd(10)} 帧=${String(r.frames).padStart(3)} 贴边帧=${String(r.badCount).padStart(3)}` +
+      ` union=[${u.x0},${u.y0}-${u.x1},${u.y1}] 最大W=${r.maxW} 最大H=${r.maxH}`);
+    if (r.badCount) {
+      const s = r.bad.map(b => `${b.f}(T${b.bT}/B${b.bB}/L${b.bL}/R${b.bR})`).join(' ');
+      console.log('   ' + s);
+    }
+  }
+  app.quit();
+});
